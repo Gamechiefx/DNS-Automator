@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+from tqdm import tqdm
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -71,12 +72,13 @@ class DNSAnalyzer:
                 raise RuntimeError(f"{tool} not found in PATH. Please install Wireshark.")
         logger.info("tshark and editcap validated successfully")
     
-    def extract_dns_data(self, json_data: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    def extract_dns_data(self, json_data: List[Dict], total_packets: int = 0) -> Tuple[List[Dict], List[Dict]]:
         """
         Parse tshark JSON output and extract DNS fields.
         
         Args:
             json_data: List of packet dictionaries from tshark JSON output
+            total_packets: Total number of packets for progress bar
             
         Returns:
             Tuple of (dns_packets, non_dns_tcp_packets)
@@ -84,7 +86,12 @@ class DNSAnalyzer:
         dns_packets = []
         non_dns_tcp_packets = []
         
-        for packet in json_data:
+        # Create progress bar
+        progress_bar = tqdm(json_data, desc="Extracting DNS packets", 
+                          total=total_packets if total_packets > 0 else len(json_data),
+                          unit="packets", leave=False)
+        
+        for packet in progress_bar:
             if '_source' not in packet:
                 continue
             
@@ -112,6 +119,7 @@ class DNSAnalyzer:
                 if dns_info:
                     dns_packets.append(dns_info)
         
+        progress_bar.close()
         return dns_packets, non_dns_tcp_packets
     
     def _extract_dns_info(self, layers: Dict) -> Optional[Dict]:
@@ -261,6 +269,170 @@ class DNSAnalyzer:
         except:
             return time_str
     
+    def _get_packet_count(self, file_path: Path) -> int:
+        """
+        Get total packet count from pcap file.
+        
+        Args:
+            file_path: Path to pcap file
+            
+        Returns:
+            Total number of packets in the file
+        """
+        try:
+            # Use capinfos which is much faster for getting packet count
+            cmd = ['capinfos', '-c', str(file_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and result.stdout:
+                # Parse output like "Number of packets:   12899"
+                for line in result.stdout.split('\n'):
+                    if 'Number of packets:' in line:
+                        count_str = line.split(':')[1].strip()
+                        # Handle 'k' notation (e.g., "12k" -> 12000)
+                        if count_str.endswith('k'):
+                            base_num = float(count_str[:-1])
+                            return int(base_num * 1000)
+                        elif count_str.isdigit():
+                            return int(count_str)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout getting packet count for {file_path.name}")
+        except Exception as e:
+            logger.warning(f"Could not get packet count using capinfos, trying fallback: {e}")
+            
+        # Fallback to tshark with tail (faster than full scan)
+        try:
+            cmd = ['tshark', '-r', str(file_path), '-T', 'fields', '-e', 'frame.number', '-c', '1', '-o', 'frame.number:1']
+            result = subprocess.run(['tshark', '-r', str(file_path), '-T', 'fields', '-e', 'frame.number'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.strip().split('\n')
+                if lines and lines[-1].isdigit():
+                    return int(lines[-1])
+        except Exception:
+            pass
+            
+        return 0
+    
+    def _process_pcap_streaming(self, file_path: Path, total_packets: int) -> bool:
+        """
+        Process large PCAP files in streaming mode to avoid memory issues.
+        
+        Args:
+            file_path: Path to pcap file
+            total_packets: Total number of packets
+            
+        Returns:
+            True if processing succeeded, False otherwise
+        """
+        try:
+            base_name = file_path.stem
+            batch_size = 100000  # Process 100k packets at a time
+            
+            # Initialize output files
+            detailed_path = self.detailed_dir / f"{base_name}_detailed.csv"
+            summary_path = self.summary_dir / f"{base_name}_summary.csv"
+            tcp_path = self.detailed_dir / f"{base_name}_non_dns_tcp.csv"
+            
+            all_dns_packets = []
+            
+            # Create progress bar for the entire file
+            progress_bar = tqdm(total=total_packets, desc=f"Processing {file_path.name}", 
+                              unit="packets", leave=True)
+            
+            processed_packets = 0
+            batch_num = 0
+            
+            while processed_packets < total_packets:
+                batch_num += 1
+                start_packet = processed_packets + 1
+                end_packet = min(processed_packets + batch_size, total_packets)
+                
+                logger.info(f"Processing batch {batch_num}: packets {start_packet}-{end_packet}")
+                
+                # Process batch using tshark with packet range filter
+                frame_filter = f"frame.number >= {start_packet} and frame.number <= {end_packet}"
+                display_filter = f"({frame_filter}) and (dns or (tcp and not dns))"
+                
+                cmd = [
+                    'tshark', '-r', str(file_path),
+                    '-T', 'json',
+                    '-e', 'ip.src', '-e', 'ip.dst', '-e', 'ipv6.src', '-e', 'ipv6.dst',
+                    '-e', 'dns.flags.response', '-e', 'dns.qry.name', '-e', 'dns.resp.name',
+                    '-e', 'dns.resp.ttl', '-e', 'dns.a', '-e', 'dns.aaaa', '-e', 'dns.txt',
+                    '-e', 'dns.cname', '-e', 'frame.time', '-e', 'tcp.srcport', '-e', 'tcp.dstport',
+                    '-Y', display_filter
+                ]
+                
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                    if result.returncode == 0 and result.stdout:
+                        batch_json = json.loads(result.stdout)
+                        
+                        # Process this batch
+                        dns_packets, non_dns_tcp_packets = self.extract_dns_data(batch_json, 0)
+                        
+                        # Append to detailed CSV
+                        self._append_detailed_csv(dns_packets, detailed_path, batch_num == 1)
+                        self._append_tcp_csv(non_dns_tcp_packets, tcp_path, batch_num == 1)
+                        
+                        # Collect DNS packets for summary
+                        all_dns_packets.extend(dns_packets)
+                        
+                        progress_bar.update(len(batch_json))
+                        processed_packets += len(batch_json)
+                        
+                    else:
+                        logger.warning(f"No data in batch {batch_num}")
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error processing batch {batch_num}: {e}")
+                    break
+            
+            progress_bar.close()
+            
+            # Generate summary from all collected DNS packets
+            if all_dns_packets:
+                self.generate_summary_csv(all_dns_packets, summary_path)
+            
+            self.processed_files.add(file_path)
+            logger.info(f"Successfully processed {file_path.name} in streaming mode")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in streaming processing {file_path.name}: {e}", exc_info=True)
+            return False
+    
+    def _append_detailed_csv(self, dns_packets: List[Dict], output_path: Path, write_header: bool = False):
+        """
+        Append DNS packets to detailed CSV file.
+        
+        Args:
+            dns_packets: List of DNS packet dictionaries
+            output_path: Path for output CSV
+            write_header: Whether to write header (first batch)
+        """
+        if not dns_packets:
+            return
+        
+        df = pd.DataFrame(dns_packets)
+        df.to_csv(output_path, mode='a', header=write_header, index=False)
+    
+    def _append_tcp_csv(self, tcp_packets: List[Dict], output_path: Path, write_header: bool = False):
+        """
+        Append TCP packets to TCP CSV file.
+        
+        Args:
+            tcp_packets: List of TCP packet dictionaries
+            output_path: Path for output CSV
+            write_header: Whether to write header (first batch)
+        """
+        if not tcp_packets:
+            return
+        
+        df = pd.DataFrame(tcp_packets)
+        df.to_csv(output_path, mode='a', header=write_header, index=False)
+    
     def process_pcap_file(self, file_path: Path) -> bool:
         """
         Process a single pcap file through the complete pipeline.
@@ -283,6 +455,16 @@ class DNSAnalyzer:
                 logger.warning(f"File {file_path.name} appears to be incomplete, skipping")
                 return False
             
+            # Get total packet count for progress bar
+            total_packets = self._get_packet_count(file_path)
+            if total_packets > 0:
+                logger.info(f"Total packets to process: {total_packets}")
+            
+            # Use streaming processing for large files (> 1M packets)
+            if total_packets > 1000000:
+                logger.info(f"Large file detected ({total_packets} packets), using streaming mode")
+                return self._process_pcap_streaming(file_path, total_packets)
+            
             # Run tshark to extract data
             json_data = self._run_tshark(file_path)
             if not json_data:
@@ -297,7 +479,7 @@ class DNSAnalyzer:
                 logger.info(f"Saved JSON to {json_output_path}")
             
             # Extract DNS data
-            dns_packets, non_dns_tcp_packets = self.extract_dns_data(json_data)
+            dns_packets, non_dns_tcp_packets = self.extract_dns_data(json_data, total_packets)
             
             logger.info(f"Extracted {len(dns_packets)} DNS packets and {len(non_dns_tcp_packets)} non-DNS TCP packets")
             
